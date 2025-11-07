@@ -9,6 +9,9 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <utility>
+#include <fstream>
+#include <sstream>
+#include <vector>
 
 #if defined(__aarch64__)
 #include <adrenotools/driver.h>
@@ -126,6 +129,54 @@ static jstring wrap(JNIEnv *env, const std::string &string) {
 }
 static jstring wrap(JNIEnv *env, const char *string) {
   return env->NewStringUTF(string);
+}
+
+// Detect GPU vendor by reading /proc/gpuinfo or checking system properties
+static bool isMaliGpu() {
+  // Check for Mali GPU by reading /proc/gpuinfo
+  std::ifstream gpuinfo("/proc/gpuinfo");
+  if (gpuinfo.is_open()) {
+    std::string line;
+    while (std::getline(gpuinfo, line)) {
+      // Look specifically for Mali GPU identifiers
+      if (line.find("Mali") != std::string::npos || 
+          line.find("mali") != std::string::npos ||
+          line.find("Mali-G") != std::string::npos ||
+          line.find("Mali-T") != std::string::npos) {
+        gpuinfo.close();
+        return true;
+      }
+    }
+    gpuinfo.close();
+  }
+  
+  // Check common Mali GPU device files
+  if (access("/dev/mali0", F_OK) == 0 || 
+      access("/dev/mali", F_OK) == 0 ||
+      access("/dev/ump", F_OK) == 0) {
+    return true;
+  }
+  
+  // Check for Mali in opengl renderer (if available)
+  // This is a fallback method
+  std::ifstream opengl("/proc/self/maps");
+  if (opengl.is_open()) {
+    std::string line;
+    while (std::getline(opengl, line)) {
+      if (line.find("libGLES_mali.so") != std::string::npos ||
+          line.find("libmali.so") != std::string::npos) {
+        opengl.close();
+        return true;
+      }
+    }
+    opengl.close();
+  }
+  
+  return false;
+}
+
+static bool isAdrenoGpu() {
+  return access("/dev/kgsl-3d0", F_OK) == 0;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -275,7 +326,8 @@ extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_settingsSet(
 extern "C" JNIEXPORT jboolean JNICALL
 Java_net_rpcsx_RPCSX_supportsCustomDriverLoading(JNIEnv *env,
                                                  jobject instance) {
-  return access("/dev/kgsl-3d0", F_OK) == 0;
+  // Support both Adreno (via adrenotools) and Mali (via direct Vulkan loading)
+  return isAdrenoGpu() || isMaliGpu();
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -297,19 +349,80 @@ Java_net_rpcsx_RPCSX_setCustomDriver(JNIEnv *env, jobject, jstring jpath,
   if (!path.empty()) {
       auto hookDir = unwrap(env, jhookDir);
       auto libraryName = unwrap(env, jlibraryName);
-      __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI", "Loading custom driver %s",
-                          path.c_str());
+      
+      if (isMaliGpu()) {
+          // For Mali GPUs, use direct Vulkan driver loading
+          __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI", 
+                              "Loading Mali GPU custom driver from %s", path.c_str());
+          
+          // Try multiple possible paths for the driver library
+          std::vector<std::string> possiblePaths;
+          
+          // Path 1: path/libraryName (as provided)
+          possiblePaths.push_back(path + "/" + libraryName);
+          
+          // Path 2: path/lib{libraryName}.so (if libraryName doesn't start with lib)
+          if (libraryName.find("lib") != 0) {
+              possiblePaths.push_back(path + "/lib" + libraryName);
+              possiblePaths.push_back(path + "/lib" + libraryName + ".so");
+          } else {
+              // If it already starts with lib, try with and without .so
+              possiblePaths.push_back(path + "/" + libraryName + ".so");
+          }
+          
+          // Path 3: path/libvulkan.so (common Vulkan driver name)
+          possiblePaths.push_back(path + "/libvulkan.so");
+          
+          ::dlerror();
+          bool loaded = false;
+          for (const auto& driverPath : possiblePaths) {
+              loader = ::dlopen(driverPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+              if (loader != nullptr) {
+                  __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI",
+                                      "Successfully loaded Mali driver from '%s'",
+                                      driverPath.c_str());
+                  loaded = true;
+                  break;
+              } else {
+                  __android_log_print(ANDROID_LOG_DEBUG, "RPCSX-UI",
+                                      "Failed to load from '%s': %s",
+                                      driverPath.c_str(), ::dlerror());
+              }
+          }
+          
+          if (!loaded) {
+              __android_log_print(ANDROID_LOG_ERROR, "RPCSX-UI",
+                                  "Failed to load Mali driver from any path");
+              return false;
+          }
+      } else if (isAdrenoGpu()) {
+          // For Adreno GPUs, use adrenotools
+          __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI", 
+                              "Loading Adreno GPU custom driver %s", path.c_str());
 
-      ::dlerror();
-      loader = adrenotools_open_libvulkan(
-              RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, (hookDir + "/").c_str(),
-              (path + "/").c_str(), libraryName.c_str(), nullptr, nullptr);
+          ::dlerror();
+          loader = adrenotools_open_libvulkan(
+                  RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, (hookDir + "/").c_str(),
+                  (path + "/").c_str(), libraryName.c_str(), nullptr, nullptr);
 
-      if (loader == nullptr) {
-          __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI",
-                              "Failed to load custom driver at '%s': %s",
-                              path.c_str(), ::dlerror());
-          return false;
+          if (loader == nullptr) {
+              __android_log_print(ANDROID_LOG_ERROR, "RPCSX-UI",
+                                  "Failed to load Adreno driver at '%s': %s",
+                                  path.c_str(), ::dlerror());
+              return false;
+          }
+      } else {
+          __android_log_print(ANDROID_LOG_WARN, "RPCSX-UI",
+                              "Unknown GPU type, attempting generic driver load");
+          // Fallback: try direct loading
+          std::string driverPath = path + "/" + libraryName;
+          loader = ::dlopen(driverPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+          if (loader == nullptr) {
+              __android_log_print(ANDROID_LOG_ERROR, "RPCSX-UI",
+                                  "Failed to load driver at '%s': %s",
+                                  driverPath.c_str(), ::dlerror());
+              return false;
+          }
       }
   }
 
