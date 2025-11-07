@@ -98,6 +98,7 @@ class RPCSX {
     external fun getDirInstallPath(sfoFd: Int) : String?
     external fun getVersion(): String
     external fun setCustomDriver(path: String, libraryName: String, hookDir: String): Boolean
+    external fun getGpuVendor(): String
 
 
     companion object {

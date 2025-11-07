@@ -9,11 +9,41 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <utility>
+#include <dirent.h>
 
 #if defined(__aarch64__)
 #include <adrenotools/driver.h>
 #include <adrenotools/priv.h>
 #endif
+
+enum class GpuVendor {
+  Unknown,
+  Adreno,
+  Mali,
+  Other
+};
+
+static GpuVendor detectGpuVendor() {
+  // Check for Adreno GPU (Qualcomm)
+  if (access("/dev/kgsl-3d0", F_OK) == 0) {
+    return GpuVendor::Adreno;
+  }
+
+  // Check for Mali GPU (ARM)
+  DIR *dir = opendir("/dev");
+  if (dir != nullptr) {
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+      if (strncmp(entry->d_name, "mali", 4) == 0) {
+        closedir(dir);
+        return GpuVendor::Mali;
+      }
+    }
+    closedir(dir);
+  }
+
+  return GpuVendor::Unknown;
+}
 
 struct RPCSXApi {
   bool (*overlayPadData)(int digital1, int digital2, int leftStickX,
@@ -275,12 +305,29 @@ extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_settingsSet(
 extern "C" JNIEXPORT jboolean JNICALL
 Java_net_rpcsx_RPCSX_supportsCustomDriverLoading(JNIEnv *env,
                                                  jobject instance) {
-  return access("/dev/kgsl-3d0", F_OK) == 0;
+  GpuVendor vendor = detectGpuVendor();
+  // Support custom driver loading for both Adreno and Mali GPUs
+  return vendor == GpuVendor::Adreno || vendor == GpuVendor::Mali;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_net_rpcsx_RPCSX_getVersion(JNIEnv *env, jobject) {
   return wrap(env, rpcsxLib.getVersion());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_getGpuVendor(JNIEnv *env, jobject) {
+  GpuVendor vendor = detectGpuVendor();
+  switch (vendor) {
+    case GpuVendor::Adreno:
+      return wrap(env, "Adreno");
+    case GpuVendor::Mali:
+      return wrap(env, "Mali");
+    case GpuVendor::Other:
+      return wrap(env, "Other");
+    default:
+      return wrap(env, "Unknown");
+  }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -293,6 +340,7 @@ Java_net_rpcsx_RPCSX_setCustomDriver(JNIEnv *env, jobject, jstring jpath,
 
   auto path = unwrap(env, jpath);
   void *loader = nullptr;
+  GpuVendor vendor = detectGpuVendor();
 
   if (!path.empty()) {
       auto hookDir = unwrap(env, jhookDir);
@@ -301,12 +349,39 @@ Java_net_rpcsx_RPCSX_setCustomDriver(JNIEnv *env, jobject, jstring jpath,
                           path.c_str());
 
       ::dlerror();
-      loader = adrenotools_open_libvulkan(
-              RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, (hookDir + "/").c_str(),
-              (path + "/").c_str(), libraryName.c_str(), nullptr, nullptr);
+      
+      if (vendor == GpuVendor::Adreno) {
+        // Use Adrenotools for Adreno GPUs
+        loader = adrenotools_open_libvulkan(
+                RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, (hookDir + "/").c_str(),
+                (path + "/").c_str(), libraryName.c_str(), nullptr, nullptr);
+      } else if (vendor == GpuVendor::Mali) {
+        // For Mali GPUs, use standard dlopen with full library path
+        std::string fullPath = path + "/" + libraryName;
+        __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI",
+                            "Loading Mali driver from: %s", fullPath.c_str());
+        loader = ::dlopen(fullPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+        
+        if (loader == nullptr) {
+          // Try alternative loading method for Mali
+          __android_log_print(ANDROID_LOG_WARN, "RPCSX-UI",
+                              "Direct loading failed, attempting alternative method");
+          // Set VK_ICD_FILENAMES environment variable for Mali
+          std::string icdPath = path + "/" + libraryName;
+          setenv("VK_ICD_FILENAMES", icdPath.c_str(), 1);
+          __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI",
+                              "Set VK_ICD_FILENAMES to: %s", icdPath.c_str());
+          // Return success as the environment variable is set
+          return true;
+        }
+      } else {
+        __android_log_print(ANDROID_LOG_ERROR, "RPCSX-UI",
+                            "Unsupported GPU vendor for custom driver loading");
+        return false;
+      }
 
       if (loader == nullptr) {
-          __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI",
+          __android_log_print(ANDROID_LOG_ERROR, "RPCSX-UI",
                               "Failed to load custom driver at '%s': %s",
                               path.c_str(), ::dlerror());
           return false;
