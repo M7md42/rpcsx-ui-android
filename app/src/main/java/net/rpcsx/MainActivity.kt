@@ -91,9 +91,19 @@ class MainActivity : ComponentActivity() {
                 RPCSX.instance.initialize(RPCSX.rootDirectory, UserRepository.getUserFromSettings())
                 val gpuDriverPath = GeneralSettings["gpu_driver_path"] as? String
                 val gpuDriverName = GeneralSettings["gpu_driver_name"] as? String
+                val supportsCustomDriverLoading = RPCSX.instance.supportsCustomDriverLoading()
 
-                if (gpuDriverPath != null && gpuDriverName != null) {
-                    RPCSX.instance.setCustomDriver(gpuDriverPath, gpuDriverName, nativeLibraryDir)
+                if (!supportsCustomDriverLoading) {
+                    if (gpuDriverPath != null || gpuDriverName != null) {
+                        Log.i("RPCSX", "Custom driver configuration cleared: unsupported GPU detected")
+                        GeneralSettings["gpu_driver_path"] = null
+                        GeneralSettings["gpu_driver_name"] = null
+                    }
+                } else if (gpuDriverPath != null && gpuDriverName != null) {
+                    val applied = RPCSX.instance.setCustomDriver(gpuDriverPath, gpuDriverName, nativeLibraryDir)
+                    if (!applied) {
+                        Log.w("RPCSX", "Failed to apply custom GPU driver, keeping previous configuration")
+                    }
                 }
 
                 lifecycleScope.launch {
